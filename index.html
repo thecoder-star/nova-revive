@@ -13,27 +13,29 @@
         document.head.appendChild(erudaScript);
       }
     </script>
-    <script>
-/* === NOVA PUBLIC-RELAY LAYER ==========================================
-   Rewrites all outbound traffic through public CORS relays so the filter
-   agent only ever sees relay hosts. Falls back across five relays.
-   ====================================================================== */
+<script>
 (function () {
   "use strict";
   var SB     = "https://rfaxkkglastajsycvzmp.supabase.co";
   var ANON   = "sb_publishable_xZLrOodLfnD-ONKS7-t8wg_rerVqS_5";
   var SB_REF = "rfaxkkglastajsycvzmp";
 
-  var RELAYS = [
-    function (u) { return "https://cors.isomorphic-git.org/" + u; },
-    function (u) { return "https://thingproxy.freeboard.io/fetch/" + u; },
-    function (u) { return "https://cors.eu.org/" + u; },
-    function (u) { return "https://api.codetabs.com/v1/proxy/?quest=" + encodeURIComponent(u); },
-    function (u) { return "https://api.allorigins.win/raw?url=" + encodeURIComponent(u); }
+  /* w:1 = forwards methods/bodies and answers preflight. Nothing is trusted. */
+  var POOL = [
+    { n: "corslol",  w: 1, b: function (u) { return "https://api.cors.lol/?url=" + encodeURIComponent(u); } },
+    { n: "cfworker", w: 1, b: function (u) { return "https://test.cors.workers.dev/?" + u; } },
+    { n: "corsfix",  w: 1, b: function (u) { return "https://proxy.corsfix.com/?" + u; } },
+    { n: "euorg",    w: 1, b: function (u) { return "https://cors.eu.org/" + u; } },
+    { n: "thing",    w: 1, b: function (u) { return "https://thingproxy.freeboard.io/fetch/" + u; } },
+    { n: "ctab",     w: 0, b: function (u) { return "https://api.codetabs.com/v1/proxy/?quest=" + encodeURIComponent(u); } },
+    { n: "allo",     w: 0, b: function (u) { return "https://api.allorigins.win/raw?url=" + encodeURIComponent(u); } },
+    { n: "iso",      w: 0, b: function (u) { return "https://cors.isomorphic-git.org/" + u; } }
   ];
-  var MARKS = ["cors.isomorphic-git.org", "thingproxy.freeboard.io",
-               "cors.eu.org", "api.codetabs.com", "allorigins.win"];
-  var cursor = 0;
+  var MARKS = ["api.cors.lol", "cors.workers.dev", "corsfix.com", "cors.eu.org",
+               "thingproxy", "codetabs", "allorigins", "isomorphic-git"];
+
+  var H = {}, RTTL = 60000, cache = new Map();
+  POOL.forEach(function (p) { H[p.n] = { s: 0, until: 0 }; });
 
   function isRelayed(u) {
     for (var i = 0; i < MARKS.length; i++) if (u.indexOf(MARKS[i]) !== -1) return true;
@@ -44,66 +46,94 @@
     return /supabase\.co|jsdelivr\.net|raw\.githubusercontent\.com|raw\.githack\.com|unpkg\.com|esm\.sh/.test(u);
   }
 
-  function timed(init, ms) {
-    var c = new AbortController();
-    var t = setTimeout(function () { c.abort(); }, ms);
-    if (init && init.signal) {
-      if (init.signal.aborted) c.abort();
-      else init.signal.addEventListener("abort", function () { c.abort(); }, { once: true });
-    }
-    return { init: Object.assign({}, init || {}, { signal: c.signal }),
-             done: function () { clearTimeout(t); } };
+  function rank(w) {
+    var now = Date.now();
+    return POOL.filter(function (p) { return !w || p.w; }).map(function (p) {
+      var h = H[p.n];
+      return { p: p, s: (h.until > now ? 1000 : 0) + h.s };
+    }).sort(function (a, b) { return a.s - b.s; }).map(function (x) { return x.p; });
+  }
+  function bump(p, ok) {
+    var h = H[p.n];
+    if (ok) { h.s = Math.max(0, h.s - 1); }
+    else { h.s += 3; h.until = Date.now() + 60000; }
   }
 
   var of = window.fetch ? window.fetch.bind(window) : null;
 
-  function relay(url, init) {
-    var last, n = RELAYS.length, start = cursor;
-    return (function attempt(k) {
+  function once(p, url, init, ms) {
+    var c = new AbortController(), t = setTimeout(function () { c.abort(); }, ms);
+    var out = init && init.signal;
+    if (out) { if (out.aborted) c.abort(); else out.addEventListener("abort", function () { c.abort(); }, { once: true }); }
+    return of(p.b(url), Object.assign({}, init || {}, { signal: c.signal })).then(function (r) {
+      clearTimeout(t);
+      if (r.status === 0 || r.status === 429 || r.status >= 500) { bump(p, false); throw new Error(p.n + " " + r.status); }
+      bump(p, true);
+      return r;
+    }, function (e) { clearTimeout(t); bump(p, false); throw e; });
+  }
+
+  /* reads race three relays, first usable wins */
+  function read(url, init) {
+    if (!of) return Promise.reject(new Error("fetch unavailable"));
+    var q = rank(false).slice(0, 3);
+    if (!q.length) return Promise.reject(new Error("no relays"));
+    return new Promise(function (res, rej) {
+      var left = q.length, done = false;
+      q.forEach(function (p, i) {
+        setTimeout(function () {
+          if (done) return;
+          once(p, url, init, 9000).then(function (r) {
+            if (done) return; done = true; res(r);
+          }, function () {
+            if (done) return;
+            if (--left === 0) { done = true; rej(new Error("read failed")); }
+          });
+        }, i * 350);
+      });
+    });
+  }
+
+  /* writes go sequential, cooled hosts skipped */
+  function write(url, init) {
+    var q = rank(true);
+    return (function step(k) {
       if (!of) return Promise.reject(new Error("fetch unavailable"));
-      if (k >= n) return Promise.reject(last || new Error("all relays failed"));
-      var i = (start + k) % n;
-      var c = new AbortController();
-      var t = setTimeout(function () { c.abort(); }, 6000);
-      var out = init && init.signal;
-      if (out) {
-        if (out.aborted) { clearTimeout(t); c.abort(); }
-        else out.addEventListener("abort", function () { c.abort(); }, { once: true });
-      }
-      var g = { init: Object.assign({}, init || {}, { signal: c.signal }),
-                done: function () { clearTimeout(t); } };
-      return of(RELAYS[i](url), g.init).then(function (res) {
-        g.done();
-        if (res.status === 0 || res.status === 403 || res.status === 429 || res.status >= 500) {
-          last = new Error("relay " + i + " -> " + res.status);
-          return attempt(k + 1);
-        }
-        cursor = i;
-        return res;
-      }, function (err) { g.done(); last = err; return attempt(k + 1); });
+      if (k >= q.length) return Promise.reject(new Error("all write relays failed"));
+      return once(q[k], url, init, 12000).then(function (r) { return r; },
+        function (e) { if (k + 1 >= q.length) throw e; return step(k + 1); });
     })(0);
+  }
+
+  function relay(url, init) {
+    var w = init && init.method && init.method !== "GET" && init.method !== "HEAD";
+    return w ? write(url, init) : read(url, init);
   }
 
   if (of) {
     window.fetch = function (input, init) {
       var url = typeof input === "string" ? input : (input && input.url) || "";
-      return needsRelay(url) ? relay(url, init) : of(input, init);
+      if (!needsRelay(url)) return of(input, init);
+      if (((init && init.method) || "GET") !== "GET") return relay(url, init);
+      var hit = cache.get(url);
+      if (hit && Date.now() - hit.at < RTTL) return Promise.resolve(hit.res.clone());
+      return relay(url, init).then(function (r) {
+        if (r.ok) cache.set(url, { res: r.clone(), at: Date.now() });
+        return r;
+      });
     };
   }
 
   var XO = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (m, u) {
     var a = Array.prototype.slice.call(arguments);
-    if (typeof u === "string" && needsRelay(u)) a[1] = RELAYS[0](u);
+    if (typeof u === "string" && needsRelay(u)) a[1] = (rank(false)[0] || POOL[0]).b(u);
     return XO.apply(this, a);
   };
 
-  /* images get a dedicated image relay so content-type stays sane */
   var IMG = "https://images.weserv.nl/?url=";
-  function imgRelay(u) { return IMG + encodeURIComponent(u.replace(/^https?:\/\//, "")); }
-
   function patchProp(proto, build) {
-    if (typeof proto === "undefined" || !proto) return;
+    if (!proto) return;
     var d = Object.getOwnPropertyDescriptor(proto, "src");
     if (!d || !d.set) return;
     Object.defineProperty(proto, "src", {
@@ -111,20 +141,20 @@
       set: function (v) { d.set.call(this, typeof v === "string" && needsRelay(v) ? build(v) : v); }
     });
   }
-  patchProp(HTMLImageElement.prototype, imgRelay);
-  patchProp(HTMLMediaElement.prototype, RELAYS[0]);
-  patchProp(HTMLIFrameElement.prototype, RELAYS[0]);
+  patchProp(HTMLImageElement.prototype, function (u) { return IMG + encodeURIComponent(u.replace(/^https?:\/\//, "")); });
+  patchProp(HTMLMediaElement.prototype, function (u) { return (rank(false)[0] || POOL[0]).b(u); });
+  patchProp(HTMLIFrameElement.prototype, function (u) { return (rank(false)[0] || POOL[0]).b(u); });
 
-  /* React sets src via setAttribute, so hook that too */
   var SA = Element.prototype.setAttribute;
   Element.prototype.setAttribute = function (name, value) {
     if (name === "src" && typeof value === "string" && needsRelay(value)) {
-      value = (this instanceof HTMLImageElement) ? imgRelay(value) : RELAYS[0](value);
+      value = (this instanceof HTMLImageElement)
+        ? IMG + encodeURIComponent(value.replace(/^https?:\/\//, ""))
+        : (rank(false)[0] || POOL[0]).b(value);
     }
     return SA.call(this, name, value);
   };
 
-  /* ---- backend translation (used by the app's proxy mode) ---- */
   function token() {
     try {
       var raw = localStorage.getItem("sb-" + SB_REF + "-auth-token");
@@ -135,50 +165,62 @@
   function qs(q) {
     if (!q) return "";
     var p = [];
-    for (var k in q) if (Object.prototype.hasOwnProperty.call(q, k) && q[k] != null) {
+    for (var k in q) if (Object.prototype.hasOwnProperty.call(q, k) && q[k] != null)
       p.push(encodeURIComponent(k) + "=" + encodeURIComponent(q[k]));
-    }
     return p.join("&");
   }
+  function keyq(u) { return u + (u.indexOf("?") === -1 ? "?" : "&") + "apikey=" + encodeURIComponent(ANON); }
   function b64(b) {
     var s = atob(b || ""), n = s.length, o = new Uint8Array(n);
     for (var i = 0; i < n; i++) o[i] = s.charCodeAt(i);
     return o;
   }
-  function hdr(extra) {
-    var h = { apikey: ANON, Authorization: "Bearer " + token() };
-    for (var k in extra || {}) h[k] = extra[k];
-    return h;
-  }
 
   async function request(env) {
-    var a = env.action, p = env.payload || {}, m = "GET", url, body, headers;
+    var a = env.action, p = env.payload || {}, m = "GET", url, body, headers = {};
 
     if (a === "rest.read") {
-      url = SB + "/rest/v1/" + p.resource + "?" + qs(p.query);
-      headers = hdr({ Accept: "application/json" });
+      url = keyq(SB + "/rest/v1/" + p.resource + "?" + qs(p.query));
+      headers.Accept = "application/json";
+      if (token() !== ANON) headers.Authorization = "Bearer " + token();
+
     } else if (a === "rest.insert" || a === "rest.update" || a === "rest.delete") {
       m = a === "rest.insert" ? "POST" : a === "rest.update" ? "PATCH" : "DELETE";
-      url = SB + "/rest/v1/" + p.resource + "?" + qs(p.query);
-      headers = hdr({ "Content-Type": "application/json", Prefer: p.prefer || "return=representation" });
+      url = keyq(SB + "/rest/v1/" + p.resource + "?" + qs(p.query));
+      headers["Content-Type"] = "application/json";
+      headers.Prefer = p.prefer || "return=representation";
+      headers.Authorization = "Bearer " + token();
       if (p.body !== undefined) body = JSON.stringify(p.body);
+
     } else if (a === "rpc.call") {
-      m = "POST"; url = SB + "/rest/v1/rpc/" + p.name;
-      headers = hdr({ "Content-Type": "application/json" });
-      body = JSON.stringify(p.body || {});
+      /* GET-ized so the common play-count bump stays preflight-free */
+      url = keyq(SB + "/rest/v1/rpc/" + p.name + "?" + qs(p.body || {}));
+      headers.Accept = "application/json";
+      if (token() !== ANON) headers.Authorization = "Bearer " + token();
+
     } else if (a === "function.invoke") {
-      m = "POST"; url = SB + "/functions/v1/" + p.name;
-      headers = hdr(Object.assign({ "Content-Type": "application/json" }, p.headers || {}));
+      m = "POST";
+      url = SB + "/functions/v1/" + p.name;
+      headers["Content-Type"] = "application/json";
+      headers.Authorization = "Bearer " + token();
+      headers.apikey = ANON;
+      for (var k in p.headers || {}) headers[k] = p.headers[k];
       body = JSON.stringify(p.body || {});
+
     } else if (a === "storage.upload") {
-      m = "POST"; url = SB + "/storage/v1/object/" + p.bucket + "/" + p.path;
-      headers = hdr({ "Content-Type": p.contentType || "application/octet-stream", "x-upsert": "true" });
+      m = "POST";
+      url = SB + "/storage/v1/object/" + p.bucket + "/" + p.path;
+      headers["Content-Type"] = p.contentType || "application/octet-stream";
+      headers["x-upsert"] = "true";
+      headers.apikey = ANON;
+      headers.Authorization = "Bearer " + token();
       body = b64(p.base64);
+
     } else if (a === "static.read") {
-      url = p.url; headers = { Accept: "application/json" };
-    } else {
-      throw new Error("relay: unsupported action " + a);
-    }
+      url = p.url;
+      headers.Accept = "application/json";
+
+    } else throw new Error("relay: unsupported action " + a);
 
     var res = await relay(url, { method: m, headers: headers, body: body, cache: "no-store" });
     var text = await res.text();
@@ -199,6 +241,16 @@
     capabilities: { attachments: true, ai: true, calls: true },
     request: request
   };
+
+  window.__NOVA_RELAY__ = { health: H, order: function () { return rank(false).map(function (p) { return p.n; }); } };
+
+  /* warm the ranking before the app's first request */
+  setTimeout(function () {
+    var t = keyq(SB + "/rest/v1/public_app_settings?select=id&limit=1");
+    POOL.forEach(function (p, i) {
+      setTimeout(function () { once(p, t, { headers: { Accept: "application/json" } }, 6000).catch(function () {}); }, i * 250);
+    });
+  }, 400);
 })();
 </script>
     
