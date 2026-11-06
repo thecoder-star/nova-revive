@@ -27,12 +27,12 @@
   var RELAYS = [
     function (u) { return "https://cors.isomorphic-git.org/" + u; },
     function (u) { return "https://thingproxy.freeboard.io/fetch/" + u; },
-    function (u) { return "https://corsproxy.io/?url=" + encodeURIComponent(u); },
-    function (u) { return "https://api.allorigins.win/raw?url=" + encodeURIComponent(u); },
-    function (u) { return "https://api.codetabs.com/v1/proxy/?quest=" + encodeURIComponent(u); }
+    function (u) { return "https://cors.eu.org/" + u; },
+    function (u) { return "https://api.codetabs.com/v1/proxy/?quest=" + encodeURIComponent(u); },
+    function (u) { return "https://api.allorigins.win/raw?url=" + encodeURIComponent(u); }
   ];
   var MARKS = ["cors.isomorphic-git.org", "thingproxy.freeboard.io",
-               "corsproxy.io", "allorigins.win", "api.codetabs.com"];
+               "cors.eu.org", "api.codetabs.com", "allorigins.win"];
   var cursor = 0;
 
   function isRelayed(u) {
