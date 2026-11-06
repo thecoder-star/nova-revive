@@ -73,6 +73,16 @@
     }, function (e) { clearTimeout(t); bump(p, false); throw e; });
   }
 
+  function direct(url, init, ms) {
+    var c = new AbortController(), t = setTimeout(function () { c.abort(); }, ms);
+    var out = init && init.signal;
+    if (out) { if (out.aborted) c.abort(); else out.addEventListener("abort", function () { c.abort(); }, { once: true }); }
+    return of(url, Object.assign({}, init || {}, { signal: c.signal })).then(function (r) {
+      clearTimeout(t);
+      return r;
+    }, function (e) { clearTimeout(t); throw e; });
+  }
+
   /* reads race three relays, first usable wins */
   function read(url, init) {
     if (!of) return Promise.reject(new Error("fetch unavailable"));
@@ -107,6 +117,12 @@
 
   function relay(url, init) {
     var w = init && init.method && init.method !== "GET" && init.method !== "HEAD";
+    if (of && url.indexOf(SB) === 0) {
+      return direct(url, init, 5000).then(function (r) {
+        if (r.status === 0 || r.status === 429 || r.status >= 500) return w ? write(url, init) : read(url, init);
+        return r;
+      }, function () { return w ? write(url, init) : read(url, init); });
+    }
     return w ? write(url, init) : read(url, init);
   }
 
