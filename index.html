@@ -34,7 +34,7 @@
   var MARKS = ["api.cors.lol", "cors.workers.dev", "corsfix.com", "cors.eu.org",
                "thingproxy", "codetabs", "allorigins", "isomorphic-git"];
 
-  var H = {}, RTTL = 60000, cache = new Map();
+  var H = {}, RTTL = 60000, cache = new Map(), lastRead = null;
   POOL.forEach(function (p) { H[p.n] = { s: 0, until: 0 }; });
 
   function isRelayed(u) {
@@ -94,7 +94,11 @@
         setTimeout(function () {
           if (done) return;
           once(p, url, init, 9000).then(function (r) {
-            if (done) return; done = true; res(r);
+            if (done) return;
+            done = true;
+            lastRead = { proxy: p.n, host: new URL(url, window.location.href).host, at: Date.now() };
+            console.info("[nova] read relay succeeded:", lastRead.proxy, lastRead.host);
+            res(r);
           }, function () {
             if (done) return;
             if (--left === 0) { done = true; rej(new Error("read failed")); }
@@ -258,7 +262,11 @@
     request: request
   };
 
-  window.__NOVA_RELAY__ = { health: H, order: function () { return rank(false).map(function (p) { return p.n; }); } };
+  window.__NOVA_RELAY__ = {
+    health: H,
+    order: function () { return rank(false).map(function (p) { return p.n; }); },
+    lastRead: function () { return lastRead; }
+  };
 
   /* warm the ranking before the app's first request */
   setTimeout(function () {
