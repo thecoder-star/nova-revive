@@ -62,7 +62,16 @@
     return (function attempt(k) {
       if (!of) return Promise.reject(new Error("fetch unavailable"));
       if (k >= n) return Promise.reject(last || new Error("all relays failed"));
-      var i = (start + k) % n, g = timed(init, 20000);
+      var i = (start + k) % n;
+      var c = new AbortController();
+      var t = setTimeout(function () { c.abort(); }, 6000);
+      var out = init && init.signal;
+      if (out) {
+        if (out.aborted) { clearTimeout(t); c.abort(); }
+        else out.addEventListener("abort", function () { c.abort(); }, { once: true });
+      }
+      var g = { init: Object.assign({}, init || {}, { signal: c.signal }),
+                done: function () { clearTimeout(t); } };
       return of(RELAYS[i](url), g.init).then(function (res) {
         g.done();
         if (res.status === 0 || res.status === 403 || res.status === 429 || res.status >= 500) {
